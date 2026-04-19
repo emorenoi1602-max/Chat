@@ -11,7 +11,7 @@ import pandas as pd
 
 # ── CONFIG ────────────────────────────────────────────────
 DATA_DIR   = "data"
-DASHBOARD  = "Shein_BPO_Dashboard.html"
+DASHBOARD  = "index.html"
 PARTICLES  = {"DE","DEL","LA","LAS","LOS","EL","Y"}
 # ─────────────────────────────────────────────────────────
 
