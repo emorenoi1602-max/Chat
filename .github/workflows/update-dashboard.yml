@@ -1,0 +1,40 @@
+name: 🔄 Actualizar Dashboard Shein
+
+on:
+  push:
+    paths:
+      - 'data/*.xlsx'       # Se activa cuando subes un Excel a la carpeta /data
+      - 'data/*.xls'
+
+  workflow_dispatch:        # También permite ejecución manual desde GitHub
+
+jobs:
+  build-dashboard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # Permite que el Action haga commit al repo
+
+    steps:
+      - name: 📥 Clonar repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🐍 Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Instalar dependencias
+        run: pip install pandas openpyxl
+
+      - name: ⚙️ Ejecutar script de actualización
+        run: python scripts/update_dashboard.py
+
+      - name: 📤 Publicar dashboard actualizado
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🤖 Dashboard actualizado automáticamente [$(date +'%Y-%m-%d %H:%M')]"
+          file_pattern: 'Shein_BPO_Dashboard.html'
+          commit_user_name: 'GitHub Actions Bot'
+          commit_user_email: 'actions@github.com'
