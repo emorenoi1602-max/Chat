@@ -1,66 +1,87 @@
 """
 update_dashboard.py
-───────────────────
-Lee los archivos .xlsx de /data, los combina con la data histórica
-que ya está embebida en index.html, y publica el resultado.
-La data histórica NUNCA se pierde aunque no estén todos los Excel.
+───────────────────────────────────────────────────
+Lee todos los archivos .xlsx de la carpeta /data,
+los consolida en un único dataset sin duplicados de días,
+aplica correcciones de nombres de asesores,
+e inyecta los datos actualizados en index.html
 """
 
 import os, re, json, glob
 import pandas as pd
 
-# ── CONFIG ────────────────────────────────────────────────
+# ── CONFIG ────────────────────────────────────────────────────────
 DATA_DIR   = "data"
 DASHBOARD  = "index.html"
 PARTICLES  = {"DE","DEL","LA","LAS","LOS","EL","Y"}
-# ─────────────────────────────────────────────────────────
+
+# ── NOMBRES FIJOS POR CÓDIGO ──────────────────────────────────────
+# Primer nombre + primer apellido.
+# Cuando ingresen asesores nuevos, agrega la línea aquí:
+# 'ATLCOLBAQxxx': 'Nombre Apellido',
+NAME_FIXES = {
+    'ATLCOLBAQ314': 'Andrés Ruíz',
+    'ATLCOLBAQ315': 'Luisa Castillo',
+    'ATLCOLBAQ316': 'Pedro Piñeres',
+    'ATLCOLBAQ317': 'Sharly Salcedo',
+    'ATLCOLBAQ318': 'Cristina Vargas',
+    'ATLCOLBAQ319': 'Juan Calderón',
+    # → Nuevos ingresos van aquí:
+    # 'ATLCOLBAQ320': 'Nombre Apellido',
+}
+# ─────────────────────────────────────────────────────────────────
 
 
 def parse_name(raw: str) -> str:
+    """Extrae primer nombre + primer apellido del formato MX-CODIGO-NOMBRE-Pais."""
     raw = str(raw).strip()
+
+    # Si el valor es un código conocido, aplicar fix directo
+    if raw in NAME_FIXES:
+        return NAME_FIXES[raw]
+
     m = re.match(
         r"^MX-[A-Z0-9]+-(.+)-(?:Colombia|Mexico|Peru|Ecuador|Venezuela)$",
         raw, re.IGNORECASE
     )
     if not m:
         parts = raw.split("-")
+        code = parts[0] if parts else raw
+        if code in NAME_FIXES:
+            return NAME_FIXES[code]
         return parts[1] if len(parts) > 1 else raw
+
     name = re.sub(r"[\s\u00A0]+", " ", m.group(1)).strip()
     words = name.split()
     if not words:
         return raw
+
     cap = lambda w: w[0].upper() + w[1:].lower()
     first = cap(words[0])
-    if len(words) == 1: return first
-    if len(words) == 2: return first + " " + cap(words[1])
+    if len(words) == 1:
+        return first
+    if len(words) == 2:
+        return first + " " + cap(words[1])
+
     idx = 2
     while idx < len(words) and words[idx].upper() in PARTICLES:
         idx += 1
     if idx >= len(words):
         idx = len(words) - 1
+
     return first + " " + cap(words[idx])
+
+
+def apply_name_fixes(records: list) -> list:
+    """Aplica NAME_FIXES sobre registros ya procesados (segunda pasada de seguridad)."""
+    for r in records:
+        if r['a'] in NAME_FIXES:
+            r['a'] = NAME_FIXES[r['a']]
+    return records
 
 
 def iso_week(d: pd.Timestamp) -> int:
     return int(d.isocalendar().week)
-
-
-def load_existing_data(html_path: str) -> list:
-    """Extrae RAW_DATA que ya está embebida en el index.html."""
-    if not os.path.exists(html_path):
-        return []
-    with open(html_path, "r", encoding="utf-8") as f:
-        html = f.read()
-    m = re.search(r"const RAW_DATA=(\[.*?\]);", html, re.DOTALL)
-    if not m:
-        return []
-    try:
-        records = json.loads(m.group(1))
-        print(f"  📦 Data histórica en {html_path}: {len(records):,} registros")
-        return records
-    except Exception as e:
-        print(f"  ⚠️  No se pudo leer RAW_DATA del HTML: {e}")
-        return []
 
 
 def load_excel(path: str) -> pd.DataFrame:
@@ -71,7 +92,7 @@ def load_excel(path: str) -> pd.DataFrame:
     df["date_str"]   = df["Date"].dt.strftime("%Y-%m-%d")
     df["week"]       = df["Date"].apply(iso_week)
     df["month"]      = df["Date"].dt.month
-    print(f"     → {len(df)} registros | {df['date_str'].min()} → {df['date_str'].max()}")
+    print(f"     → {len(df)} registros activos | {df['date_str'].min()} → {df['date_str'].max()}")
     return df
 
 
@@ -98,101 +119,76 @@ def df_to_records(df: pd.DataFrame) -> list:
     return records
 
 
-def merge_records(existing: list, new_records: list) -> list:
+def merge_dataframes(frames: list) -> pd.DataFrame:
     """
-    Combina registros existentes con los nuevos.
-    Para días que aparecen en ambos, los nuevos tienen prioridad.
-    La data histórica que no está en los Excel nuevos se conserva intacta.
+    Une todos los DataFrames. Si un mismo día aparece en varios archivos,
+    prevalece el del archivo más reciente (último en la lista).
     """
-    # Fechas cubiertas por los nuevos Excel
-    new_dates = set(r["d"] for r in new_records)
+    if not frames:
+        return pd.DataFrame()
 
-    # Conservar histórico que NO está en los nuevos archivos
-    historical = [r for r in existing if r["d"] not in new_dates]
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.sort_values(["date_str", "Agent Name"])
+    combined = combined.drop_duplicates(subset=["date_str", "short_name"], keep="last")
 
-    # Combinar: histórico + nuevos
-    combined = historical + new_records
-
-    # Ordenar por fecha y agente
-    combined.sort(key=lambda r: (r["d"], r["a"]))
-
-    return combined
+    return combined.sort_values("date_str")
 
 
 def inject_data(html: str, records: list) -> str:
     new_data = json.dumps(records, ensure_ascii=False)
-    updated  = re.sub(
-        r"const RAW_DATA=\[.*?\];",
-        f"const RAW_DATA={new_data};",
-        html, flags=re.DOTALL
-    )
+    updated  = re.sub(r"const RAW_DATA=\[.*?\];", f"const RAW_DATA={new_data};",
+                      html, flags=re.DOTALL)
     if updated == html:
-        raise ValueError("No se encontró RAW_DATA en el HTML.")
+        raise ValueError("No se encontró RAW_DATA en el HTML. Verifica que el dashboard es correcto.")
     return updated
 
 
 def main():
-    xlsx_files = sorted(
-        glob.glob(os.path.join(DATA_DIR, "*.xlsx")) +
-        glob.glob(os.path.join(DATA_DIR, "*.xls"))
-    )
+    # 1. Buscar todos los xlsx en /data
+    xlsx_files = sorted(glob.glob(os.path.join(DATA_DIR, "*.xlsx")) +
+                        glob.glob(os.path.join(DATA_DIR, "*.xls")))
 
     if not xlsx_files:
-        print("⚠️  No hay archivos Excel en /data. No se modifica el dashboard.")
+        print("⚠️  No se encontraron archivos Excel en /data. Nada que actualizar.")
         return
 
-    print(f"\n🔍 Archivos nuevos en /{DATA_DIR}:")
+    print(f"\n🔍 Archivos encontrados en /{DATA_DIR}:")
     for f in xlsx_files:
         print(f"   • {os.path.basename(f)}")
 
-    # 1. Extraer data histórica del HTML actual
-    print(f"\n📖 Leyendo data histórica de {DASHBOARD}...")
-    existing_records = load_existing_data(DASHBOARD)
-
-    # 2. Leer todos los Excel nuevos
-    print(f"\n📊 Procesando archivos Excel...")
+    # 2. Cargar y consolidar
     frames = [load_excel(f) for f in xlsx_files]
-    combined_df = pd.concat(frames, ignore_index=True)
-    # Si mismo día aparece en varios Excel, queda el último
-    combined_df = combined_df.drop_duplicates(
-        subset=["date_str", "short_name"], keep="last"
-    )
-    new_records = df_to_records(combined_df)
+    merged = merge_dataframes(frames)
 
-    # 3. Merge inteligente
-    print(f"\n🔀 Combinando con data histórica...")
-    new_dates = sorted(set(r["d"] for r in new_records))
-    print(f"   Días en Excel nuevos  : {len(new_dates)} ({new_dates[0]} → {new_dates[-1]})")
-    print(f"   Registros históricos  : {len(existing_records):,}")
-    print(f"   Registros nuevos      : {len(new_records):,}")
+    records = df_to_records(merged)
 
-    final_records = merge_records(existing_records, new_records)
+    # 3. Aplicar correcciones de nombres (segunda pasada de seguridad)
+    records = apply_name_fixes(records)
 
-    # Stats finales
-    all_dates  = sorted(set(r["d"] for r in final_records))
-    all_agents = sorted(set(r["a"] for r in final_records))
+    dates  = sorted(set(r["d"] for r in records))
+    agents = sorted(set(r["a"] for r in records))
 
-    print(f"\n✅ Dataset final consolidado:")
-    print(f"   Registros totales : {len(final_records):,}")
-    print(f"   Rango de fechas   : {all_dates[0]} → {all_dates[-1]}")
-    print(f"   Días únicos       : {len(all_dates)}")
-    print(f"   Agentes activos   : {len(all_agents)}")
+    print(f"\n✅ Dataset consolidado:")
+    print(f"   Registros activos : {len(records):,}")
+    print(f"   Rango de fechas   : {dates[0]} → {dates[-1]}")
+    print(f"   Días únicos       : {len(dates)}")
+    print(f"   Agentes activos   : {len(agents)}")
 
     # 4. Inyectar en el HTML
     if not os.path.exists(DASHBOARD):
-        raise FileNotFoundError(f"No se encontró {DASHBOARD}")
+        raise FileNotFoundError(f"No se encontró {DASHBOARD} en la raíz del repo.")
 
     with open(DASHBOARD, "r", encoding="utf-8") as f:
         html = f.read()
 
-    html_updated = inject_data(html, final_records)
+    html_updated = inject_data(html, records)
 
     with open(DASHBOARD, "w", encoding="utf-8") as f:
         f.write(html_updated)
 
     size_kb = os.path.getsize(DASHBOARD) // 1024
     print(f"\n🚀 {DASHBOARD} actualizado ({size_kb} KB)")
-    print(f"   Visible en GitHub Pages en ~1-2 minutos.\n")
+    print(f"   Los cambios serán visibles en GitHub Pages en ~1-2 minutos.\n")
 
 
 if __name__ == "__main__":
