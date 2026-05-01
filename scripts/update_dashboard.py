@@ -1,10 +1,11 @@
 """
 update_dashboard.py
 ───────────────────────────────────────────────────
-Lee todos los archivos .xlsx de la carpeta /data,
-los consolida en un único dataset sin duplicados de días,
-aplica correcciones de nombres de asesores,
-e inyecta los datos actualizados en index.html
+1. Extrae RAW_DATA del index.html actual (histórico)
+2. Lee todos los .xlsx de /data (datos nuevos)
+3. Merge inteligente: nuevos reemplazan días duplicados,
+   histórico se conserva aunque no esté en /data
+4. Inyecta el resultado en index.html
 """
 
 import os, re, json, glob
@@ -33,13 +34,9 @@ NAME_FIXES = {
 
 
 def parse_name(raw: str) -> str:
-    """Extrae primer nombre + primer apellido del formato MX-CODIGO-NOMBRE-Pais."""
     raw = str(raw).strip()
-
-    # Si el valor es un código conocido, aplicar fix directo
     if raw in NAME_FIXES:
         return NAME_FIXES[raw]
-
     m = re.match(
         r"^MX-[A-Z0-9]+-(.+)-(?:Colombia|Mexico|Peru|Ecuador|Venezuela)$",
         raw, re.IGNORECASE
@@ -55,25 +52,21 @@ def parse_name(raw: str) -> str:
     words = name.split()
     if not words:
         return raw
-
     cap = lambda w: w[0].upper() + w[1:].lower()
     first = cap(words[0])
     if len(words) == 1:
         return first
     if len(words) == 2:
         return first + " " + cap(words[1])
-
     idx = 2
     while idx < len(words) and words[idx].upper() in PARTICLES:
         idx += 1
     if idx >= len(words):
         idx = len(words) - 1
-
     return first + " " + cap(words[idx])
 
 
 def apply_name_fixes(records: list) -> list:
-    """Aplica NAME_FIXES sobre registros ya procesados (segunda pasada de seguridad)."""
     for r in records:
         if r['a'] in NAME_FIXES:
             r['a'] = NAME_FIXES[r['a']]
@@ -84,6 +77,22 @@ def iso_week(d: pd.Timestamp) -> int:
     return int(d.isocalendar().week)
 
 
+def extract_historical(html: str) -> list:
+    """Extrae el RAW_DATA embebido en el HTML actual como base histórica."""
+    m = re.search(r"const RAW_DATA=(\[.*?\]);", html, flags=re.DOTALL)
+    if not m:
+        print("  ⚠️  No se encontró RAW_DATA histórico en el HTML — se inicia desde cero.")
+        return []
+    try:
+        records = json.loads(m.group(1))
+        dates = sorted(set(r["d"] for r in records))
+        print(f"  📚 Histórico extraído del HTML: {len(records):,} registros ({dates[0]} → {dates[-1]})")
+        return records
+    except Exception as e:
+        print(f"  ⚠️  Error al parsear histórico: {e} — se inicia desde cero.")
+        return []
+
+
 def load_excel(path: str) -> pd.DataFrame:
     print(f"  📂 Leyendo: {os.path.basename(path)}")
     df = pd.read_excel(path, parse_dates=["Date"])
@@ -92,7 +101,7 @@ def load_excel(path: str) -> pd.DataFrame:
     df["date_str"]   = df["Date"].dt.strftime("%Y-%m-%d")
     df["week"]       = df["Date"].apply(iso_week)
     df["month"]      = df["Date"].dt.month
-    print(f"     → {len(df)} registros activos | {df['date_str'].min()} → {df['date_str'].max()}")
+    print(f"     → {len(df)} registros | {df['date_str'].min()} → {df['date_str'].max()}")
     return df
 
 
@@ -119,19 +128,35 @@ def df_to_records(df: pd.DataFrame) -> list:
     return records
 
 
-def merge_dataframes(frames: list) -> pd.DataFrame:
+def merge_records(historical: list, new_records: list) -> list:
     """
-    Une todos los DataFrames. Si un mismo día aparece en varios archivos,
-    prevalece el del archivo más reciente (último en la lista).
+    Merge inteligente:
+    - Base: histórico del HTML (Ene–Mar y lo que ya estaba)
+    - Los registros nuevos (del Excel) reemplazan días duplicados
+    - El histórico se conserva íntegro para días no presentes en los Excel
     """
-    if not frames:
-        return pd.DataFrame()
+    # Construir índice del histórico: (fecha, agente) → registro
+    index = {(r["d"], r["a"]): r for r in historical}
 
-    combined = pd.concat(frames, ignore_index=True)
-    combined = combined.sort_values(["date_str", "Agent Name"])
-    combined = combined.drop_duplicates(subset=["date_str", "short_name"], keep="last")
+    new_days = set()
+    for r in new_records:
+        key = (r["d"], r["a"])
+        index[key] = r  # nuevo reemplaza histórico si mismo día+agente
+        new_days.add(r["d"])
 
-    return combined.sort_values("date_str")
+    merged = sorted(index.values(), key=lambda r: (r["d"], r["a"]))
+
+    hist_days  = sorted(set(r["d"] for r in historical))
+    final_days = sorted(set(r["d"] for r in merged))
+
+    print(f"\n  📊 Resultado del merge:")
+    print(f"     Días en histórico  : {len(hist_days)}")
+    print(f"     Días en Excel nuevo: {len(new_days)}")
+    print(f"     Días en resultado  : {len(final_days)}")
+    print(f"     Registros totales  : {len(merged):,}")
+    print(f"     Rango final        : {final_days[0]} → {final_days[-1]}")
+
+    return merged
 
 
 def inject_data(html: str, records: list) -> str:
@@ -139,49 +164,51 @@ def inject_data(html: str, records: list) -> str:
     updated  = re.sub(r"const RAW_DATA=\[.*?\];", f"const RAW_DATA={new_data};",
                       html, flags=re.DOTALL)
     if updated == html:
-        raise ValueError("No se encontró RAW_DATA en el HTML. Verifica que el dashboard es correcto.")
+        raise ValueError("No se encontró RAW_DATA en el HTML.")
     return updated
 
 
 def main():
-    # 1. Buscar todos los xlsx en /data
+    # 1. Leer HTML actual y extraer histórico
+    if not os.path.exists(DASHBOARD):
+        raise FileNotFoundError(f"No se encontró {DASHBOARD} en la raíz del repo.")
+
+    print(f"\n📖 Leyendo {DASHBOARD}...")
+    with open(DASHBOARD, "r", encoding="utf-8") as f:
+        html = f.read()
+
+    historical = extract_historical(html)
+
+    # 2. Buscar Excel nuevos en /data
     xlsx_files = sorted(glob.glob(os.path.join(DATA_DIR, "*.xlsx")) +
                         glob.glob(os.path.join(DATA_DIR, "*.xls")))
 
     if not xlsx_files:
-        print("⚠️  No se encontraron archivos Excel en /data. Nada que actualizar.")
+        print("\n⚠️  No se encontraron archivos Excel en /data.")
+        print("   El dashboard conserva los datos históricos sin cambios.")
         return
 
-    print(f"\n🔍 Archivos encontrados en /{DATA_DIR}:")
+    print(f"\n🔍 Archivos Excel en /{DATA_DIR}:")
     for f in xlsx_files:
         print(f"   • {os.path.basename(f)}")
 
-    # 2. Cargar y consolidar
-    frames = [load_excel(f) for f in xlsx_files]
-    merged = merge_dataframes(frames)
+    # 3. Cargar Excel y convertir a registros
+    frames      = [load_excel(f) for f in xlsx_files]
+    merged_df   = pd.concat(frames, ignore_index=True)
+    merged_df   = merged_df.drop_duplicates(subset=["date_str", "short_name"], keep="last")
+    new_records = df_to_records(merged_df)
 
-    records = df_to_records(merged)
+    # 4. Merge histórico + nuevos
+    final = merge_records(historical, new_records)
 
-    # 3. Aplicar correcciones de nombres (segunda pasada de seguridad)
-    records = apply_name_fixes(records)
+    # 5. Aplicar correcciones de nombres (pasada final)
+    final = apply_name_fixes(final)
 
-    dates  = sorted(set(r["d"] for r in records))
-    agents = sorted(set(r["a"] for r in records))
+    agents = sorted(set(r["a"] for r in final))
+    print(f"     Agentes activos   : {len(agents)}")
 
-    print(f"\n✅ Dataset consolidado:")
-    print(f"   Registros activos : {len(records):,}")
-    print(f"   Rango de fechas   : {dates[0]} → {dates[-1]}")
-    print(f"   Días únicos       : {len(dates)}")
-    print(f"   Agentes activos   : {len(agents)}")
-
-    # 4. Inyectar en el HTML
-    if not os.path.exists(DASHBOARD):
-        raise FileNotFoundError(f"No se encontró {DASHBOARD} en la raíz del repo.")
-
-    with open(DASHBOARD, "r", encoding="utf-8") as f:
-        html = f.read()
-
-    html_updated = inject_data(html, records)
+    # 6. Inyectar y guardar
+    html_updated = inject_data(html, final)
 
     with open(DASHBOARD, "w", encoding="utf-8") as f:
         f.write(html_updated)
