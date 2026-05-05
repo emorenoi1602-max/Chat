@@ -1037,7 +1037,9 @@ function render(){
 function updatePeriodLabel(){
   const month = document.getElementById('sel-month').value;
   const agent = document.getElementById('sel-agent').value;
-  let label = 'Enero–Abril 2026';
+  const allMonths = [...new Set(ALL_DATA.map(r=>r.m))].sort((a,b)=>a-b);
+  const firstM = allMonths[0], lastM = allMonths[allMonths.length-1];
+  let label = firstM===lastM ? ALL_MONTH_NAMES[firstM]+' 2026' : ALL_MONTH_NAMES[firstM]+'–'+ALL_MONTH_NAMES[lastM]+' 2026';
   if(month) label = MONTHS[+month]+' 2026';
   if(agent) label += ' · '+agent;
   document.getElementById('period-label').textContent = label;
@@ -2028,6 +2030,10 @@ function populateFilters(){
   const weeks  = [...new Set(ALL_DATA.map(r=>r.w))].sort((a,b)=>a-b);
   const agents = [...new Set(ALL_DATA.map(r=>r.a))].sort();
   const days   = [...new Set(ALL_DATA.map(r=>r.d))].sort();
+  const months = [...new Set(ALL_DATA.map(r=>r.m))].sort((a,b)=>a-b);
+
+  const sm = document.getElementById('sel-month');
+  sm.innerHTML='<option value="">Todos</option>'+months.map(m=>`<option value="${m}">${ALL_MONTH_NAMES[m]||'Mes '+m}</option>`).join('');
 
   const sw = document.getElementById('sel-week');
   sw.innerHTML='<option value="">Todas</option>'+weeks.map(w=>`<option value="${w}">Semana ${w}</option>`).join('');
